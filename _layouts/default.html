@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if page.title %}{{ page.title }}{% else %}{{ site.title }}{% endif %}</title>
+  
+  <!-- Dynamic metadata for description -->
+  <meta name="description" content="{{ page.description | default: site.description }}">
+  
+  <!-- Canonical URL tag -->
+  <link rel="canonical" href="{{ site.url }}{{ page.url }}">
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}?v={{ site.time | date: '%s' }}">
+
+  <!-- OpenGraph Metadata -->
+  <meta property="og:title" content="{% if page.title %}{{ page.title }}{% else %}{{ site.title }}{% endif %}">
+  <meta property="og:description" content="{{ page.description | default: site.description }}">
+  <meta property="og:url" content="{{ site.url }}{{ page.url }}">
+  <meta property="og:type" content="{% if page.layout == 'post' %}article{% else %}website{% endif %}">
+  
+  <!-- Twitter Card Metadata -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{% if page.title %}{{ page.title }}{% else %}{{ site.title }}{% endif %}">
+  <meta name="twitter:description" content="{{ page.description | default: site.description }}">
+  
+  {% include schema.html %}
+  <script>
+    (function() {
+      const savedTheme = localStorage.getItem('theme');
+      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      const initialTheme = savedTheme ? savedTheme : (prefersDark ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', initialTheme);
+    })();
+  </script>
+</head>
+<body>
+  <header>
+    <nav style="display: flex; justify-content: space-between; align-items: center;">
+      <a href="{{ '/' | relative_url }}" style="font-weight: 800; color: var(--heading-color); font-size: 1.5rem; letter-spacing: -0.05em; text-decoration: none;">{{ site.title }}</a>
+      <button id="theme-toggle" class="theme-toggle-btn" aria-label="Toggle Theme">
+        <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+        <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display: none;"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+      </button>
+    </nav>
+  </header>
+
+  <main class="{% if page.layout == 'post' %}layout-post{% else %}layout-page{% endif %}">
+    {{ content }}
+  </main>
+
+  <footer style="text-align: center; font-size: 0.95rem; padding-top: 2rem; border-top: 1px solid var(--border-color); margin-top: 4rem; padding-bottom: 2rem;">
+    <div style="display: flex; justify-content: center; gap: 2rem;">
+      <a href="https://github.com/HeLiX-x/tokr" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none; transition: color 0.2s;" onmouseover="this.style.color='var(--link-hover-color)'" onmouseout="this.style.color='var(--text-color)'">tokr Repository</a>
+      <a href="https://github.com/HeLiX-x" target="_blank" rel="noopener noreferrer" style="color: var(--text-color); text-decoration: none; transition: color 0.2s;" onmouseover="this.style.color='var(--link-hover-color)'" onmouseout="this.style.color='var(--text-color)'">GitHub Profile</a>
+      <a href="mailto:sankalprai969@gmail.com" style="color: var(--text-color); text-decoration: none; transition: color 0.2s;" onmouseover="this.style.color='var(--link-hover-color)'" onmouseout="this.style.color='var(--text-color)'">Email Me</a>
+    </div>
+  </footer>
+
+  <script>
+    document.addEventListener('DOMContentLoaded', () => {
+      const toggleButton = document.getElementById('theme-toggle');
+      const iconSun = document.getElementById('icon-sun');
+      const iconMoon = document.getElementById('icon-moon');
+      if (!toggleButton) return;
+      
+      const updateIcon = (theme) => {
+        if (theme === 'dark') {
+          iconSun.style.display = 'block';
+          iconMoon.style.display = 'none';
+        } else {
+          iconSun.style.display = 'none';
+          iconMoon.style.display = 'block';
+        }
+      };
+
+      const currentTheme = document.documentElement.getAttribute('data-theme');
+      updateIcon(currentTheme);
+
+      toggleButton.addEventListener('click', () => {
+        let theme = document.documentElement.getAttribute('data-theme');
+        let newTheme = theme === 'dark' ? 'light' : 'dark';
+        document.documentElement.setAttribute('data-theme', newTheme);
+        localStorage.setItem('theme', newTheme);
+        updateIcon(newTheme);
+      });
+    });
+  </script>
+</body>
+</html>

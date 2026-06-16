@@ -1,0 +1,101 @@
+---
+layout: default
+---
+
+<div class="post-layout">
+  <aside class="toc-sidebar">
+    <div class="toc-header">Table of Contents</div>
+    <nav class="toc-nav" id="toc"></nav>
+  </aside>
+
+  <article class="post-article">
+  <header class="post-hero">
+    <h1>{{ page.title }}</h1>
+    <div class="post-meta">
+      <span class="author">By Sankalp</span> &bull; 
+      <span class="date">{{ page.date | date: "%B %d, %Y" }}</span> &bull; 
+      <span class="read-time">
+        {% assign words = content | number_of_words %}
+        {% assign read_time = words | divided_by: 200 | plus: 1 %}
+        {{ read_time }} min read
+      </span>
+    </div>
+  </header>
+
+  {% if page.series %}
+    <div class="series-navigation">
+      <p>This post is part of the <strong>{{ page.series }}</strong> series:</p>
+      <ol>
+        {% assign series_posts = site.posts | where: "series", page.series | sort: "date" %}
+        {% for series_post in series_posts %}
+          <li>
+            {% if series_post.url == page.url %}
+              <em>{{ series_post.title }}</em> (This post)
+            {% else %}
+              <a href="{{ site.baseurl }}{{ series_post.url }}">{{ series_post.title }}</a>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ol>
+    </div>
+  {% endif %}
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+  </article>
+</div>
+
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const content = document.querySelector('.post-content');
+    const headings = content.querySelectorAll('h2, h3');
+    const toc = document.getElementById('toc');
+    
+    if (headings.length === 0) {
+      document.querySelector('.toc-sidebar').style.display = 'none';
+      return;
+    }
+    
+    const list = document.createElement('ul');
+    headings.forEach((heading, index) => {
+      // Create ID if not exists
+      if (!heading.id) {
+        heading.id = heading.textContent.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+      }
+      
+      const li = document.createElement('li');
+      li.className = `toc-${heading.tagName.toLowerCase()}`;
+      
+      const a = document.createElement('a');
+      a.href = `#${heading.id}`;
+      a.textContent = heading.textContent;
+      a.className = 'toc-link';
+      
+      li.appendChild(a);
+      list.appendChild(li);
+    });
+    
+    toc.appendChild(list);
+    
+    // Intersection Observer for active state
+    let currentId = '';
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          currentId = entry.target.id;
+        }
+      });
+      if (currentId) {
+        document.querySelectorAll('.toc-link').forEach(link => {
+          link.classList.remove('active');
+          if (link.getAttribute('href') === `#${currentId}`) {
+            link.classList.add('active');
+          }
+        });
+      }
+    }, { rootMargin: '-10% 0px -80% 0px' });
+    
+    headings.forEach(heading => observer.observe(heading));
+  });
+</script>
