@@ -2,7 +2,7 @@
 layout: default
 ---
 
-<div class="post-layout">
+<div class="post-layout" id="human-view">
   <aside class="toc-sidebar">
     <div class="toc-header">Table of Contents</div>
     <nav class="toc-nav" id="toc"></nav>
@@ -50,6 +50,222 @@ layout: default
   </div>
   </article>
 </div>
+
+<!-- Machine View -->
+<div id="machine-view" style="display:none; max-width: 860px; margin: 0 auto; padding: 2rem 1.5rem;">
+  <pre id="machine-content" style="
+    font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+    font-size: 0.82rem;
+    line-height: 1.75;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: transparent;
+    color: var(--text-color);
+    border: none;
+    margin: 0;
+    padding: 0;
+  "></pre>
+</div>
+
+<!-- Human / Machine Toggle -->
+<style>
+  .hm-toggle {
+    position: fixed;
+    bottom: 1.5rem;
+    right: 1.5rem;
+    display: flex;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    overflow: hidden;
+    font-family: var(--font-code);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    z-index: 1000;
+    background: var(--bg-color);
+  }
+  .hm-toggle button {
+    padding: 0.45rem 0.85rem;
+    border: none;
+    background: transparent;
+    color: var(--text-color);
+    opacity: 0.45;
+    cursor: pointer;
+    transition: background 0.15s, opacity 0.15s, color 0.15s;
+    text-transform: uppercase;
+  }
+  .hm-toggle button.active {
+    background: var(--text-color);
+    color: var(--bg-color);
+    opacity: 1;
+  }
+  .hm-toggle button:hover:not(.active) { opacity: 0.75; }
+</style>
+
+<div class="hm-toggle" role="group" aria-label="View mode">
+  <button id="btn-human" class="active" onclick="setMode('human')">Human</button>
+  <button id="btn-machine" onclick="setMode('machine')">Machine</button>
+</div>
+
+<script>
+  /* ── Human / Machine toggle ── */
+  function setMode(mode) {
+    const humanView   = document.getElementById('human-view');
+    const machineView = document.getElementById('machine-view');
+    const btnHuman    = document.getElementById('btn-human');
+    const btnMachine  = document.getElementById('btn-machine');
+
+    if (mode === 'machine') {
+      if (!machineView.dataset.built) buildMachineContent();
+      humanView.style.display   = 'none';
+      machineView.style.display = 'block';
+      btnHuman.classList.remove('active');
+      btnMachine.classList.add('active');
+      localStorage.setItem('viewMode', 'machine');
+    } else {
+      humanView.style.display   = '';
+      machineView.style.display = 'none';
+      btnHuman.classList.add('active');
+      btnMachine.classList.remove('active');
+      localStorage.setItem('viewMode', 'human');
+    }
+  }
+
+  function buildMachineContent() {
+    const machineView = document.getElementById('machine-view');
+    const pre         = document.getElementById('machine-content');
+
+    /* ── metadata header ── */
+    const title  = {{ page.title | jsonify }};
+    const date   = {{ page.date | date: "%Y-%m-%d" | jsonify }};
+    const url    = window.location.href;
+    const words  = document.querySelector('.post-content').innerText
+                     .split(/\s+/).filter(Boolean).length;
+
+    let text = '';
+    text += `# ${title}\n\n`;
+    text += `**Author:** Sankalp\n`;
+    text += `**Date:** ${date}\n`;
+    text += `**URL:** ${url}\n`;
+    text += `**Word count:** ~${words}\n`;
+    text += `\n---\n\n`;
+
+    /* ── walk the post content DOM ── */
+    const content = document.querySelector('.post-content');
+    text += domToMarkdown(content);
+
+    pre.textContent = text;
+    machineView.dataset.built = 'true';
+  }
+
+  function domToMarkdown(node) {
+    let out = '';
+    node.childNodes.forEach(child => {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const t = child.textContent;
+        if (t.trim()) out += t;
+        return;
+      }
+      if (child.nodeType !== Node.ELEMENT_NODE) return;
+
+      const tag = child.tagName.toLowerCase();
+
+      if (tag === 'h1') { out += `\n# ${child.textContent.trim()}\n\n`; return; }
+      if (tag === 'h2') { out += `\n## ${child.textContent.trim()}\n\n`; return; }
+      if (tag === 'h3') { out += `\n### ${child.textContent.trim()}\n\n`; return; }
+      if (tag === 'h4') { out += `\n#### ${child.textContent.trim()}\n\n`; return; }
+
+      if (tag === 'p') {
+        out += '\n' + inlineMarkdown(child) + '\n';
+        return;
+      }
+
+      if (tag === 'ul') {
+        child.querySelectorAll('li').forEach(li => {
+          out += `\n- ${li.textContent.trim()}`;
+        });
+        out += '\n';
+        return;
+      }
+      if (tag === 'ol') {
+        let i = 1;
+        child.querySelectorAll('li').forEach(li => {
+          out += `\n${i++}. ${li.textContent.trim()}`;
+        });
+        out += '\n';
+        return;
+      }
+
+      if (tag === 'pre' || tag === 'code') {
+        const code = child.textContent;
+        if (tag === 'pre') {
+          out += '\n```\n' + code + '\n```\n';
+        } else {
+          out += '`' + code + '`';
+        }
+        return;
+      }
+
+      if (tag === 'blockquote') {
+        child.textContent.trim().split('\n').forEach(line => {
+          out += `\n> ${line.trim()}`;
+        });
+        out += '\n';
+        return;
+      }
+
+      if (tag === 'hr') { out += '\n---\n'; return; }
+
+      if (tag === 'table') {
+        const rows = child.querySelectorAll('tr');
+        rows.forEach((row, ri) => {
+          const cells = Array.from(row.querySelectorAll('th,td'));
+          out += '\n| ' + cells.map(c => c.textContent.trim()).join(' | ') + ' |';
+          if (ri === 0) {
+            out += '\n|' + cells.map(() => '---|').join('');
+          }
+        });
+        out += '\n';
+        return;
+      }
+
+      /* SVG / diagram: skip */
+      if (tag === 'svg') { out += '\n[diagram]\n'; return; }
+
+      /* div / section / article: recurse */
+      out += domToMarkdown(child);
+    });
+    return out;
+  }
+
+  function inlineMarkdown(node) {
+    let out = '';
+    node.childNodes.forEach(child => {
+      if (child.nodeType === Node.TEXT_NODE) { out += child.textContent; return; }
+      if (child.nodeType !== Node.ELEMENT_NODE) return;
+      const tag = child.tagName.toLowerCase();
+      if (tag === 'a') {
+        const href = child.getAttribute('href') || '';
+        out += `[${child.textContent.trim()}](${href})`;
+      } else if (tag === 'strong' || tag === 'b') {
+        out += `**${child.textContent.trim()}**`;
+      } else if (tag === 'em' || tag === 'i') {
+        out += `*${child.textContent.trim()}*`;
+      } else if (tag === 'code') {
+        out += '`' + child.textContent + '`';
+      } else {
+        out += inlineMarkdown(child);
+      }
+    });
+    return out.trim();
+  }
+
+  /* ── restore saved mode on load ── */
+  document.addEventListener('DOMContentLoaded', () => {
+    if (localStorage.getItem('viewMode') === 'machine') setMode('machine');
+  });
+</script>
 
 <script>
   document.addEventListener('DOMContentLoaded', function() {
@@ -125,3 +341,49 @@ layout: default
     });
   });
 </script>
+
+
+  <article class="post-article">
+  <header class="post-hero">
+    <h1>{{ page.title }}</h1>
+    <div class="post-meta">
+      <span class="author">By Sankalp</span> &bull; 
+      <span class="date">{{ page.date | date: "%B %d, %Y" }}</span> &bull; 
+      <span class="read-time">
+        {% assign words = content | number_of_words %}
+        {% assign read_time = words | divided_by: 200 | plus: 1 %}
+        {{ read_time }} min read
+      </span>
+    </div>
+  </header>
+
+  {% if page.series %}
+    <div class="series-navigation">
+      <p>This post is part of the <strong>{{ page.series }}</strong> series:</p>
+      <ol>
+        {% assign series_posts = site.posts | where: "series", page.series | sort: "date" %}
+        {% for series_post in series_posts %}
+          <li>
+            {% if series_post.url == page.url %}
+              <em>{{ series_post.title }}</em> (This post)
+            {% else %}
+              <a href="{{ site.baseurl }}{{ series_post.url }}">{{ series_post.title }}</a>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ol>
+    </div>
+  {% endif %}
+
+  <div class="mobile-toc-container">
+    <div class="toc-header">Table of Contents</div>
+    <nav class="toc-nav" id="mobile-toc"></nav>
+  </div>
+
+  <div class="post-content">
+    {{ content }}
+  </div>
+  </article>
+</div>
+
+
