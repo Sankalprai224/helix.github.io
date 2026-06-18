@@ -1,23 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap');
 
-:root, [data-theme="dark"] {
-  --bg-color: #0f111a;
-  --text-color: #e2e4e9;
-  --heading-color: #ffffff;
-  --link-color: #58a6ff;
-  --link-hover-color: #79c0ff;
-  --code-bg: #1e212b;
-  --code-color: #c9d1d9;
-  --border-color: #30363d;
-  --table-head-bg: #1e212b;
-  --blockquote-text: rgba(226, 228, 233, 0.7);
-  --grid-color: rgba(255, 255, 255, 0.03);
-  
-  --font-body: 'Inter', system-ui, -apple-system, sans-serif;
-  --font-code: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, Monaco, monospace;
-}
-
-[data-theme="light"] {
+:root, [data-theme="light"] {
   --bg-color: #f5f5ee;
   --text-color: #1a1a1a;
   --heading-color: #000000;
@@ -29,6 +12,23 @@
   --table-head-bg: #e5e5df;
   --blockquote-text: rgba(26, 26, 26, 0.7);
   --grid-color: rgba(0, 0, 0, 0.05);
+
+  --font-body: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-code: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, Monaco, monospace;
+}
+
+[data-theme="dark"] {
+  --bg-color: #0f111a;
+  --text-color: #e2e4e9;
+  --heading-color: #ffffff;
+  --link-color: #58a6ff;
+  --link-hover-color: #79c0ff;
+  --code-bg: #1e212b;
+  --code-color: #c9d1d9;
+  --border-color: #30363d;
+  --table-head-bg: #1e212b;
+  --blockquote-text: rgba(226, 228, 233, 0.7);
+  --grid-color: rgba(255, 255, 255, 0.03);
 }
 
 html {
@@ -818,4 +818,56 @@ th {
 .read-more:hover {
   text-decoration: underline;
   color: var(--link-hover-color);
+}
+
+/* Premium Table Styles for modern tech blog look */
+.table-wrapper {
+  margin: 2.5rem 0;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  overflow: hidden;
+  background-color: var(--code-bg);
+  box-shadow: 0 8px 16px -4px rgba(0, 0, 0, 0.15), 0 4px 8px -4px rgba(0, 0, 0, 0.1);
+}
+
+.table-wrapper table {
+  margin: 0;
+  border-collapse: collapse;
+  width: 100%;
+}
+
+.table-wrapper th, .table-wrapper td {
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 0.95rem;
+}
+
+.table-wrapper th {
+  background-color: rgba(0, 0, 0, 0.15);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  letter-spacing: 0.05em;
+  color: var(--text-color);
+  opacity: 0.9;
+}
+
+.table-wrapper tr:last-child td {
+  border-bottom: none;
+}
+
+.table-wrapper tr:nth-child(even) {
+  background-color: rgba(255, 255, 255, 0.015);
+}
+
+.table-wrapper tr:hover {
+  background-color: rgba(255, 255, 255, 0.03);
+}
+
+.dark-mode .table-wrapper tr:nth-child(even) {
+  background-color: rgba(0, 0, 0, 0.1);
+}
+
+.dark-mode .table-wrapper tr:hover {
+  background-color: rgba(0, 0, 0, 0.2);
 }

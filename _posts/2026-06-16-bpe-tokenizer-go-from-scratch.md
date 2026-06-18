@@ -1,281 +1,345 @@
 ---
 layout: post
-title: "Building a Fast BPE Tokenizer in Pure Go"
+title: "tokr: A Pure Go BPE Tokenizer"
 date: 2026-06-16 10:00:00 +0530
 slug: bpe-tokenizer-go-from-scratch
 ---
 
-I was working on a Go project that needed to tokenize text before feeding it into an LLM pipeline. Every option I found had the same problem. They either shelled out to Python, used CGO to wrap the Rust `tiktoken` library, or pulled in half a framework to do something conceptually simple. I didn't want a Python sidecar. I didn't want to fight CGO on a Linux ARM box at 2am. I wanted a pure Go tokenizer that I could ship as a single binary, understand completely, and eventually blame only myself for.
+Every Go project that needs tokenization lands on the same answer: shell out to Python or wrap OpenAI's Rust library via CGO. That means your Docker image needs a C toolchain, cross-compilation breaks, and you're debugging crashes across the Go/C boundary.
 
-So I built `tokr`: a Byte-Pair Encoding tokenizer in pure Go that hits **~9 MB/s throughput, ~5.3M tokens/sec on the hot path, and a 52-nanosecond cached response time**. That's roughly 80% of what OpenAI's `tiktoken` achieves in Rust. This post is the story of how that number came to be, what I got wrong first, and what the architecture actually looks like under the hood.
+I wanted a single binary. No sidecar. No CGO. So I built `tokr`, a Byte-Pair Encoding tokenizer in pure Go.
 
-> **URL slug:** `/posts/bpe-tokenizer-go-from-scratch`  
-> If you found this searching for "BPE tokenizer Go implementation" or "tiktoken alternative pure Go" then yes, you're in the right place.
-
----
-
-## Why BPE? A Sixty-Second Primer
-
-Why does any of this matter?
-
-Language models don't read words. They read *tokens*, which are chunks of text that sit somewhere between a character and a word. Byte-Pair Encoding (BPE) is the algorithm that decides what those chunks are. GPT-4 uses it. LLaMA uses it. It works like this:
-
-1. Start with a vocabulary of 256 individual bytes (every possible byte value, 0–255).
-2. Count every adjacent pair of tokens in your training corpus.
-3. Merge the most frequent pair into a new single token. Assign it the next available ID (starting at 256).
-4. Repeat until you reach your target vocabulary size.
-
-The result is a vocabulary that naturally captures common English subwords (`" the"`, `"ing"`, `" and"`), while still being able to represent literally anything, even binary data, because you always fall back to raw bytes.
-
-When you encode new text, you replay those merges in the order they were learned, always choosing the merge with the lowest rank (the one learned earliest) at each step. That's the whole algorithm. The hard part is doing it fast.
+**[GitHub →](https://github.com/Sankalprai224/tokr)**
 
 ---
 
-## The Architecture: Four Layers, One Binary
+## What is BPE?
 
-Here's how `tokr` is structured:
+Language models don't read words. They read tokens, chunks somewhere between a character and a word. BPE is the algorithm that decides what those chunks are. GPT-4 uses it, LLaMA uses it.
 
-<div class="arch-diagram">
-  <div class="arch-node">Input Text</div>
-  
-  <div class="arch-arrow">
-    <svg width="24" height="30" viewBox="0 0 24 30"><path d="M12 0v28M5 21l7 7 7-7" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-  </div>
-  
-  <div class="arch-row">
-    <div class="arch-box">
-      <div class="arch-box-title">Splitter Module</div>
-      <div class="arch-box-desc">GPTSplit (regexp2)<br>or FastSplit (custom scanner)</div>
-    </div>
-    <div class="arch-note"><span style="margin-right:0.5rem">←</span> Pre-tokenization boundary enforcement</div>
-  </div>
-  
-  <div class="arch-arrow">
-    <div class="arch-arrow-label">[]string chunks</div>
-    <svg width="24" height="30" viewBox="0 0 24 30"><path d="M12 0v28M5 21l7 7 7-7" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-  </div>
-  
-  <div class="arch-row">
-    <div class="arch-box">
-      <div class="arch-box-title">BPE Engine</div>
-      <div class="arch-box-desc">Cache check (O(1) RWMutex)<br>Rank-based merge loop</div>
-    </div>
-    <div class="arch-note"><span style="margin-right:0.5rem">←</span> runMergeLogic, in-place slice mutation</div>
-  </div>
-  
-  <div class="arch-arrow">
-    <svg width="24" height="20" viewBox="0 0 24 20"><path d="M12 0v20" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-  </div>
-  
-  <div class="arch-branch-container">
-    <div class="arch-branch-horizontal"></div>
-    <div class="arch-branch-verticals">
-      <div class="arch-branch-line-left"><div class="arch-arrow-head"></div></div>
-      <div class="arch-branch-line-right"><div class="arch-arrow-head"></div></div>
-    </div>
-  </div>
-  
-  <div class="arch-split-row">
-    <div class="arch-box small-box">
-      <div class="arch-box-title">Single-threaded</div>
-      <div class="arch-box-desc">Encode()</div>
-    </div>
-    <div class="arch-box small-box">
-      <div class="arch-box-title">Worker Pool</div>
-      <div class="arch-box-desc">ParallelEncode()<br><span style="font-size: 0.75rem; opacity: 0.8">(runtime.NumCPU workers,<br>buffered channels)</span></div>
-    </div>
-  </div>
-  
-  <div class="arch-arrow" style="margin-top: 1rem;">
-    <svg width="24" height="30" viewBox="0 0 24 30"><path d="M12 0v28M5 21l7 7 7-7" fill="none" stroke="currentColor" stroke-width="2"/></svg>
-  </div>
-  
-  <div class="arch-row">
-    <div class="arch-box" style="border-color: var(--link-color); background: rgba(88, 166, 255, 0.05);">
-      <div class="arch-box-title">HTTP Layer</div>
-      <div class="arch-box-desc">/encode  /decode<br>Smart routing: &lt;999KB → single, ≥999KB → pool</div>
-    </div>
-    <div class="arch-note"><span style="margin-right:0.5rem">←</span> net/http, no framework</div>
-  </div>
-</div>
-
-Every layer has exactly one job. The splitter doesn't merge. The merge engine doesn't split. The HTTP layer doesn't know what a token is; it just routes.
+Start with 256 raw bytes. Find the most frequent adjacent pair in your training data, merge it into a new token, repeat until you hit your target vocabulary size. When you encode new text, you replay those merges in the order they were learned. That's the whole thing.
 
 ---
 
 ## The HTTP API
 
-This is a feature it should not be at the last of the blog. `tokr` ships with a lightweight server (`net/http` only, no frameworks):
+`tokr` runs as a lightweight HTTP server, `net/http` only, no frameworks.
 
-You just send a POST request to `/encode` with a JSON payload containing your text, and it returns the tokens, the token count, and the time taken in seconds. Similarly, you can hit `/decode` with an array of tokens to get the text back.
+```
+POST /encode   { "text": "..." }  →  { "tokens": [...], "count": N, "time_seconds": 0.000052 }
+POST /decode   { "tokens": [...] }  →  { "text": "..." }
+```
 
-The routing logic in `/encode` is a simple size gate. Below 999KB, the single-threaded cache-optimized path wins. Above it, the worker pool takes over. The model loads once at startup and stays in memory.
+Small requests go through the single-threaded cached path. Anything over 999KB routes automatically to the parallel worker pool. The model loads once at startup and stays in memory.
 
 ---
 
-## Layer 1: The Splitter
+## The Architecture
 
-This was the first thing I got wrong conceptually. You can't just take a string like `"Hello world"`, convert it to bytes, and start merging. If you do, the merge algorithm will happily create a token that spans the space between `"Hello"` and `"world"`. Now `" wo"` is a single token in your vocabulary. That's not how GPT-4 does it, and it breaks cross-model compatibility.
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 910" width="100%" style="font-family:'JetBrains Mono',ui-monospace,monospace;border-radius:12px;display:block;margin:2rem 0">
+  <defs>
+    <marker id="a" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(255,255,255,0.35)"/></marker>
+    <marker id="b" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0,8 3,0 6" fill="rgba(255,255,255,0.18)"/></marker>
+  </defs>
+  <!-- Background -->
+  <rect width="720" height="910" fill="#111" rx="12"/>
+  <!-- Section labels -->
+  <text transform="rotate(-90,20,185)" x="20" y="185" text-anchor="middle" fill="rgba(255,255,255,0.22)" font-size="10" font-weight="700" letter-spacing="3">TRAIN</text>
+  <text transform="rotate(-90,20,500)" x="20" y="500" text-anchor="middle" fill="rgba(255,255,255,0.22)" font-size="10" font-weight="700" letter-spacing="3">ENCODE</text>
+  <text transform="rotate(-90,20,710)" x="20" y="710" text-anchor="middle" fill="rgba(255,255,255,0.22)" font-size="10" font-weight="700" letter-spacing="3">DECODE</text>
+  <!-- Section backgrounds -->
+  <rect x="36" y="18" width="672" height="320" rx="10" fill="rgba(60,32,125,0.07)" stroke="rgba(90,59,163,0.22)" stroke-width="1"/>
+  <rect x="36" y="352" width="672" height="270" rx="10" fill="rgba(138,39,18,0.07)" stroke="rgba(179,62,37,0.22)" stroke-width="1"/>
+  <rect x="36" y="636" width="672" height="92" rx="10" fill="rgba(12,62,122,0.07)" stroke="rgba(26,93,179,0.22)" stroke-width="1"/>
+  <!-- ── TRAIN NODES ── -->
+  <!-- Raw text input -->
+  <rect x="268" y="32" width="170" height="42" rx="8" fill="#1e1e1e" stroke="#555" stroke-width="1"/>
+  <text x="353" y="49" text-anchor="middle" fill="#999" font-size="12" font-weight="600">Raw text input</text>
+  <!-- SplitText -->
+  <rect x="48" y="98" width="174" height="54" rx="8" fill="#2d1865" stroke="#6a4bd4" stroke-width="1"/>
+  <text x="135" y="120" text-anchor="middle" fill="#c8b8ff" font-size="12" font-weight="700">SplitText</text>
+  <text x="135" y="138" text-anchor="middle" fill="#c8b8ff" font-size="10" opacity=".7">GPT-4 regex or FastSplit</text>
+  <!-- getStats -->
+  <rect x="254" y="98" width="196" height="54" rx="8" fill="#0a3d2e" stroke="#1a9970" stroke-width="1"/>
+  <text x="352" y="120" text-anchor="middle" fill="#7ee8c2" font-size="11" font-weight="700">getStats + merge loop</text>
+  <text x="352" y="138" text-anchor="middle" fill="#7ee8c2" font-size="10" opacity=".7">vocabSize – 256 iterations</text>
+  <!-- orderedPairs -->
+  <rect x="482" y="98" width="210" height="54" rx="8" fill="#2d1865" stroke="#6a4bd4" stroke-width="1"/>
+  <text x="587" y="120" text-anchor="middle" fill="#c8b8ff" font-size="11" font-weight="700">orderedPairs + merges</text>
+  <text x="587" y="138" text-anchor="middle" fill="#c8b8ff" font-size="10" opacity=".7">pair→rank map, ordered list</text>
+  <!-- [][]int -->
+  <rect x="48" y="186" width="174" height="42" rx="8" fill="#2d1865" stroke="#6a4bd4" stroke-width="1"/>
+  <text x="135" y="212" text-anchor="middle" fill="#c8b8ff" font-size="11" font-weight="600">[][]int ids workspace</text>
+  <!-- merger() -->
+  <rect x="254" y="180" width="196" height="54" rx="8" fill="#0a3d2e" stroke="#1a9970" stroke-width="1"/>
+  <text x="352" y="202" text-anchor="middle" fill="#7ee8c2" font-size="12" font-weight="700">merger()</text>
+  <text x="352" y="220" text-anchor="middle" fill="#7ee8c2" font-size="10" opacity=".7">sync.Pool buf, in-place collapse</text>
+  <!-- buildVocab() -->
+  <rect x="482" y="180" width="210" height="54" rx="8" fill="#2d1865" stroke="#6a4bd4" stroke-width="1"/>
+  <text x="587" y="202" text-anchor="middle" fill="#c8b8ff" font-size="12" font-weight="700">buildVocab()</text>
+  <text x="587" y="220" text-anchor="middle" fill="#c8b8ff" font-size="10" opacity=".7">vocab + tokenLens maps</text>
+  <!-- Save/Load -->
+  <rect x="482" y="264" width="210" height="42" rx="8" fill="#1e1e1e" stroke="#555" stroke-width="1"/>
+  <text x="587" y="281" text-anchor="middle" fill="#999" font-size="11" font-weight="600">Save / Load</text>
+  <text x="587" y="297" text-anchor="middle" fill="#999" font-size="10" opacity=".7">(.model file)</text>
+  <!-- TRAIN ARROWS -->
+  <line x1="353" y1="74" x2="200" y2="98" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="222" y1="125" x2="254" y2="125" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="450" y1="125" x2="482" y2="125" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="135" y1="152" x2="135" y2="186" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="222" y1="207" x2="254" y2="207" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="450" y1="207" x2="482" y2="207" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="587" y1="234" x2="587" y2="264" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <!-- next merge dashed loop -->
+  <path d="M352 234 L352 255 L228 255 L228 125" stroke="rgba(255,255,255,0.18)" stroke-width="1.5" stroke-dasharray="5,4" fill="none" marker-end="url(#b)"/>
+  <text x="244" y="268" fill="rgba(255,255,255,0.28)" font-size="10">next merge</text>
+  <!-- ── ENCODE NODES ── -->
+  <!-- Encode() -->
+  <rect x="48" y="368" width="174" height="54" rx="8" fill="#5c1a0e" stroke="#c44025" stroke-width="1"/>
+  <text x="135" y="390" text-anchor="middle" fill="#ffb3a3" font-size="12" font-weight="700">Encode()</text>
+  <text x="135" y="408" text-anchor="middle" fill="#ffb3a3" font-size="10" opacity=".7">single-threaded entry</text>
+  <!-- cache lookup -->
+  <rect x="254" y="368" width="196" height="54" rx="8" fill="#5c3700" stroke="#c4820a" stroke-width="1"/>
+  <text x="352" y="390" text-anchor="middle" fill="#ffd07a" font-size="12" font-weight="700">cache lookup</text>
+  <text x="352" y="408" text-anchor="middle" fill="#ffd07a" font-size="10" opacity=".7">cacheMu RWMutex, full-clear evict</text>
+  <!-- cache hit -->
+  <rect x="482" y="368" width="210" height="54" rx="8" fill="#5c3700" stroke="#c4820a" stroke-width="1"/>
+  <text x="587" y="390" text-anchor="middle" fill="#ffd07a" font-size="12" font-weight="700">cache hit → return</text>
+  <text x="587" y="408" text-anchor="middle" fill="#ffd07a" font-size="10" opacity=".7">reads t.merges</text>
+  <!-- ParallelEncode() -->
+  <rect x="48" y="456" width="174" height="54" rx="8" fill="#5c1a0e" stroke="#c44025" stroke-width="1"/>
+  <text x="135" y="478" text-anchor="middle" fill="#ffb3a3" font-size="11" font-weight="700">ParallelEncode()</text>
+  <text x="135" y="496" text-anchor="middle" fill="#ffb3a3" font-size="10" opacity=".7">1 MB chunks, boundary scan</text>
+  <!-- encodeCore() -->
+  <rect x="254" y="456" width="196" height="54" rx="8" fill="#5c1a0e" stroke="#c44025" stroke-width="1"/>
+  <text x="352" y="478" text-anchor="middle" fill="#ffb3a3" font-size="12" font-weight="700">encodeCore()</text>
+  <text x="352" y="496" text-anchor="middle" fill="#ffb3a3" font-size="10" opacity=".7">regex match or FastSplit loop</text>
+  <!-- runMergeLogic() -->
+  <rect x="482" y="456" width="210" height="54" rx="8" fill="#0a3d2e" stroke="#1a9970" stroke-width="1"/>
+  <text x="587" y="478" text-anchor="middle" fill="#7ee8c2" font-size="12" font-weight="700">runMergeLogic()</text>
+  <text x="587" y="496" text-anchor="middle" fill="#7ee8c2" font-size="10" opacity=".7">O(n²) greedy BPE merge</text>
+  <!-- worker pool -->
+  <rect x="48" y="542" width="174" height="54" rx="8" fill="#0a3d2e" stroke="#1a9970" stroke-width="1"/>
+  <text x="135" y="564" text-anchor="middle" fill="#7ee8c2" font-size="12" font-weight="700">worker pool</text>
+  <text x="135" y="582" text-anchor="middle" fill="#7ee8c2" font-size="10" opacity=".7">NumCPU goroutines, ordered results</text>
+  <!-- ENCODE ARROWS -->
+  <line x1="222" y1="395" x2="254" y2="395" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="450" y1="395" x2="482" y2="395" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="352" y1="422" x2="352" y2="456" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="358" y="442" fill="rgba(255,255,255,0.3)" font-size="10">miss</text>
+  <line x1="135" y1="510" x2="135" y2="542" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="222" y1="483" x2="254" y2="483" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="450" y1="483" x2="482" y2="483" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <!-- worker pool → encodeCore diagonal -->
+  <line x1="222" y1="566" x2="283" y2="510" stroke="rgba(255,255,255,0.2)" stroke-width="1.5" marker-end="url(#a)"/>
+  <!-- ── DECODE NODES ── -->
+  <!-- Decode() -->
+  <rect x="48" y="650" width="174" height="54" rx="8" fill="#0a2a52" stroke="#1a6dd4" stroke-width="1"/>
+  <text x="135" y="672" text-anchor="middle" fill="#7ab8ff" font-size="12" font-weight="700">Decode()</text>
+  <text x="135" y="690" text-anchor="middle" fill="#7ab8ff" font-size="10" opacity=".7">mu.Rlock, tokenLens prealloc</text>
+  <!-- strings.Builder -->
+  <rect x="254" y="650" width="196" height="54" rx="8" fill="#0a2a52" stroke="#1a6dd4" stroke-width="1"/>
+  <text x="352" y="672" text-anchor="middle" fill="#7ab8ff" font-size="12" font-weight="700">strings.Builder</text>
+  <text x="352" y="690" text-anchor="middle" fill="#7ab8ff" font-size="10" opacity=".7">Grow(totalLen), vocab[] write</text>
+  <!-- string output -->
+  <rect x="482" y="650" width="210" height="54" rx="8" fill="#1e1e1e" stroke="#555" stroke-width="1"/>
+  <text x="587" y="677" text-anchor="middle" fill="#999" font-size="12" font-weight="600">string output</text>
+  <!-- DECODE ARROWS -->
+  <line x1="222" y1="677" x2="254" y2="677" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <line x1="450" y1="677" x2="482" y2="677" stroke="rgba(255,255,255,0.3)" stroke-width="1.5" marker-end="url(#a)"/>
+  <!-- ── TOKENIZER STRUCT ── -->
+  <text x="460" y="748" text-anchor="middle" fill="rgba(255,255,255,0.22)" font-size="10">↓ written by Train / Load</text>
+  <line x1="587" y1="306" x2="587" y2="742" stroke="rgba(255,255,255,0.1)" stroke-width="1" stroke-dasharray="4,4"/>
+  <rect x="36" y="758" width="672" height="82" rx="10" fill="#1e124a" stroke="#6a4bd4" stroke-width="1"/>
+  <text x="372" y="780" text-anchor="middle" fill="#d4c0ff" font-size="13" font-weight="700">tokenizer struct (shared state)</text>
+  <text x="150" y="802" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">merges map[pair]int</text>
+  <text x="372" y="802" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">vocab map[int][]byte</text>
+  <text x="600" y="802" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">tokenLens map[int]int</text>
+  <text x="150" y="820" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">cache + cacheMu</text>
+  <text x="372" y="820" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">mu sync.RWMutex</text>
+  <text x="600" y="820" text-anchor="middle" fill="#d4c0ff" font-size="10" opacity=".65">bufferpool sync.Pool</text>
+  <!-- ── LEGEND ── -->
+  <rect x="48" y="858" width="11" height="11" rx="2" fill="#6a4bd4"/><text x="65" y="868" fill="rgba(255,255,255,0.45)" font-size="11">core data structures</text>
+  <rect x="220" y="858" width="11" height="11" rx="2" fill="#1a9970"/><text x="237" y="868" fill="rgba(255,255,255,0.45)" font-size="11">merge algorithms</text>
+  <rect x="380" y="858" width="11" height="11" rx="2" fill="#c44025"/><text x="397" y="868" fill="rgba(255,255,255,0.45)" font-size="11">encode entry points</text>
+  <rect x="560" y="858" width="11" height="11" rx="2" fill="#c4820a"/><text x="577" y="868" fill="rgba(255,255,255,0.45)" font-size="11">cache layer</text>
+  <rect x="48" y="880" width="11" height="11" rx="2" fill="#1a6dd4"/><text x="65" y="890" fill="rgba(255,255,255,0.45)" font-size="11">decode path</text>
+  <rect x="220" y="880" width="11" height="11" rx="2" fill="#555"/><text x="237" y="890" fill="rgba(255,255,255,0.45)" font-size="11">I/O and external</text>
+</svg>
 
-The fix is pre-tokenization. Before BPE even sees the text, you split it into chunks at semantic boundaries. Merges are only allowed to happen *within* a chunk, never across them.
+Four layers, each with one job. The splitter doesn't merge. The merge engine doesn't split. The HTTP layer just routes.
 
-`tokr` has two splitters.
+---
 
-### GPTSplit: Full Compatibility Mode
+## The Four Layers
 
-This uses the exact regex GPT-4's tokenizer uses.
 
-<div class="skip-note">
-  <div class="skip-note-title"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg> Deep Dive (Feel free to skip)</div>
-  I had to pull in github.com/dlclark/regexp2 because Go's standard regexp package doesn't support Unicode category expressions like \p{L} (letter) and \p{N} (number). The regexp2 library is a Go port of .NET's regex engine. It's powerful, correct, and notoriously allocation-heavy. I'll explain how I dealt with that later.
+
+**Layer 1, Splitter:** Raw text can't go directly into BPE. Without boundaries, merges cross word edges and produce tokens that straddle spaces, which breaks compatibility with every other tokenizer. The splitter cuts text at semantic boundaries first. `GPTSplit` uses the exact GPT-4 regex pattern for tiktoken compatibility. `FastSplit` is a hand-rolled Unicode scanner with zero allocations, about 3x faster with slight edge-case differences.
+
+**Layer 2, Merge Engine:** Scans the token array for the lowest-rank pair, merges it in-place using `copy`, shrinks the slice, repeats. No new allocations per iteration. Early versions allocated a fresh slice every step, which turns into 18 million allocations on a 16MB file. In-place drops that to zero.
+
+**Layer 3, Cache:** Natural language is repetitive. `" the"` doesn't need to be encoded from scratch a million times. Every encoded chunk gets stored in a `sync.RWMutex`-guarded map. Cache hits skip the regex engine and the merge loop entirely, it's just a map lookup. The result is a 47x latency difference between cold and warm path.
+
+**Layer 4, Worker Pool:** For inputs over 1MB, the text splits into chunks and encodes across `runtime.NumCPU()` goroutines via buffered channels. The chunker scans backward from each split point to find a natural boundary so words are never cut mid-token. A bitwise check handles multi-byte Unicode so the regex engine never gets a malformed string.
+
+---
+
+## Benchmarks
+
+### How the comparison was set up
+
+tiktoken was benchmarked using its official Python library (`tiktoken` package, `cl100k_base` encoding). tokr was benchmarked using its own `ParallelEncode` path with `useGPT4=true`, which runs the same GPT-4 regex pattern. Both were run on the same corpus.
+
+The benchmark corpus (`real_world.txt`) was generated by `generate_data.py`, a script that mixes English prose paragraphs, code snippets (Go, Python, SQL, JS), and Unicode edge cases (Japanese, emoji, accented Latin). This was intentional. A tokenizer that only performs well on clean English prose is not useful in production.
+
+```python
+SIZES = {
+    "prose":   50000,   # paragraphs
+    "code":    20000,   # code blocks
+    "unicode": 10000,   # mixed scripts
+}
+```
+
+The heavy test (`10MB.txt`) was generated by `generate_heavy.py`, which cycles through prose, code, JSON log lines, whitespace-only strings, and punctuation noise to stress the branch predictor and avoid an artificially warm cache from repetition.
+
+### Go benchmark suite
+
+The Go benchmarks in `bpe/bench_test.go` cover:
+
+- `BenchmarkEncodeCore_Micro`: cold path with a minimal dummy tokenizer, measures raw merge loop cost
+- `BenchmarkEncode_Cached`: hot path after cache warm, measures the map lookup and defensive copy
+- `BenchmarkEncode_RealModel_{1KB,100KB,500KB}`: single-threaded Encode on realistic input sizes
+- `BenchmarkParallelEncode_10MB`: full worker pool on a 10MB corpus
+- `BenchmarkEncode_Single_vs_Parallel`: side-by-side on a 16MB payload to isolate the GC bottleneck
+- `BenchmarkEncode_CacheHitRate`: server simulation with 5 rotating sentences to measure cache efficiency
+- `BenchmarkDecode_RealModel`: measures the pre-computed allocation and Builder write path
+- `BenchmarkRoundTrip_RealModel`: encode then decode round-trip on 50KB
+
+Run them yourself:
+
+```
+make bench
+# or
+go test -bench=. -benchmem ./bpe/
+```
+
+### Server load test
+
+`bench_server.go` hammers the live HTTP server with 50 concurrent workers firing 10,000 total requests. Each request is a roughly 160-byte realistic payload. This measures real request-per-second throughput including HTTP overhead, JSON marshalling, and goroutine scheduling.
+
+### Fuzzing
+
+`fuzz_test.go` and `test_fuzzy.py` both target round-trip integrity: `Decode(Encode(text)) == text`. The Go fuzzer runs against the `FastSplit` path with randomized inputs. The Python fuzzer (`hypothesis` library, 1000 examples) sends requests to the live server and checks every response. Neither has found a mismatch.
+
+```
+make fuzz   # Go native fuzzer, 10s
+```
+
+### Results
+
+Tests run on AMD Ryzen 5 7530U, 25MB mixed corpus.
+
+**vs tiktoken:**
+
+<div class="table-wrapper" markdown="1">
+
+| Library  | Language       | Throughput  | Speed           |
+|----------|----------------|-------------|-----------------|
+| tiktoken | Rust + Python  | 11.33 MB/s  | ~3.7M tokens/s  |
+| tokr     | Pure Go        | 9.03 MB/s   | ~5.3M tokens/s  |
+
 </div>
 
-### FastSplit: The Zero-Allocation Path
+<div id="chart-tiktoken-compare" class="chart-container" style="margin-top:2rem;margin-bottom:1rem;"></div>
 
-For cases where you don't need 1:1 tiktoken compatibility, `FastSplit` is a hand-rolled Unicode scanner.
+tokr shows higher tokens/sec but lower MB/s. These measure different things. MB/s is raw input bytes per second. Tokens/sec depends on average token length. tokr's vocabulary produces slightly shorter average tokens on this corpus so it generates more tokens per byte. Both are real, they just answer different questions.
 
-I wrote this because `regexp2` on a 100KB input was allocating millions of times in benchmarks. `FastSplit` produces zero heap allocations during the scan itself. It just slices into the existing rune slice. It's about 3x faster than `GPTSplit` on raw throughput, at the cost of slight tokenization differences from the canonical GPT-4 output.
+**Hot vs cold path:**
 
-The tradeoff is explicit here. `useGPT4 bool` is threaded through every public API call. You pick your tradeoff at the call site.
+<div class="table-wrapper" markdown="1">
 
----
+| Path            | Latency      | Allocations |
+|-----------------|--------------|-------------|
+| Cached (hot)    | 52–220 ns    | 1           |
+| Uncached (cold) | ~10.23 µs    | 75          |
 
-## Layer 2: The Merge Engine
+</div>
 
-The core of the tokenizer is `runMergeLogic`. This is where the actual BPE encoding happens for a single pre-tokenized chunk.
+<div id="chart-latency-bar" class="chart-container" style="margin-top:2rem;margin-bottom:1rem;"></div>
 
-The key design decision here is in-place mutation with `copy`. Early versions of this function did the obvious thing: allocate a new slice every iteration, append to it. That's O(n) allocations per chunk, which turns into 18 million allocations on a 16MB corpus.
+The single allocation on the hot path is a defensive copy of the cached slice. Without it, callers could corrupt the cache for every future request.
 
-The in-place approach overwrites the lowest rank mergeable pair with the merged token ID, then shifts the right half of the slice one position left using `copy`. The slice shrinks by one element per iteration. Zero heap allocations. No GC pressure on the hot path.
+<div id="chart-latency-line" class="chart-container" style="margin-top: 2rem; margin-bottom: 2rem;"></div>
 
-The tradeoff is that the caller's slice is mutated. If you need the original, you have to copy it before calling. The `encodeCore` function handles this by keeping `ids` as a reusable working buffer.
+**Raw parallel scaling:**
 
----
+```
+SingleThreaded   2.93 MB/s    18.6M allocs
+Parallel         3.30 MB/s    18.6M allocs
+```
 
-## Layer 3: The Cache
+<div id="chart-scaling-bar" class="chart-container" style="margin-top:2rem;margin-bottom:1rem;"></div>
 
-Here's the benchmark that made this click for me:
-
-<div id="chart-latency" class="chart-container"></div>
-
-That's roughly a 47x latency difference between cold and hot path. Once a string has been tokenized once, all future calls return in ~52–220 nanoseconds with a single allocation.
-
-The `RWMutex` is deliberate. Concurrent reads (cache hits) don't block each other. Only a write (a cache miss that populates the cache) takes the exclusive lock. In a server handling many concurrent requests for common strings, this matters a lot.
-
-Eviction strategy is naive right now. When the cache exceeds 100,000 entries, the whole map is replaced with a fresh empty one. It's a full clear, not LRU. I know. I'll fix this later.
-
-One more thing about cache correctness. When a cache hit is returned, the code makes a defensive copy. Without it, a caller who mutates the returned slice would corrupt the cached value for every future caller. It costs one allocation. It's absolutely worth it. I considered removing it, then remembered that "zero allocations but occasionally wrong" is a lot worse than "one allocation, always correct."
+Adding more cores bought only 13%. The root cause is `regexp2`. To match the GPT-4 pattern exactly, tokr uses a Go port of the .NET regex engine. It's the only option in Go that supports the `\p{L}` and `\p{N}` Unicode category expressions the pattern requires. The problem is that `regexp2` is allocation-heavy by design. On a 16MB cold input, it produces 18.6 million allocations. The Go runtime ends up spending most of its time on allocation locks rather than actual BPE work. Adding cores doesn't help because they all contend on the same allocator. This is the GC wall. Parallel only pays off once the cache is warm and the merge loop stops touching `regexp2` entirely.
 
 ---
 
-## Layer 4: The Worker Pool
+## What Still Needs Fixing
 
-For inputs over 1MB, `tokr` splits the text into ~1MB chunks and encodes them in parallel using a buffered jobs channel.
-
-The chunking is careful about two things:
-
-1. **Natural boundaries:** The splitter scans backward from the 1MB mark to find a space or newline so words are never cut mid-token. A chunk boundary inside `"tokenizer"` would create two incomplete chunks that BPE would encode incorrectly.
-2. **UTF-8 integrity:** If no natural boundary is found in the backward scan, there's a bitwise fallback to ensure we don't split mid-rune and hand `regexp2` a malformed string that causes a panic.
-
-On a 16MB corpus with parallel encoding:
-
-<div id="chart-scaling" class="chart-container"></div>
-
-The parallel speedup on raw (uncached) input is only about 13%. The bottleneck isn't CPU cores, it's GC pressure from 18 million allocations. The parallel path shines when chunks hit the cache on subsequent calls.
-
----
-
-## The Performance Story
-
-This is the part worth slowing down on. The benchmark numbers only make sense if you understand the problem they're solving.
-
-### Raw Compute Hits a Wall
-
-`regexp2` is the cost of correctness. It's the only Go library I found that handles the Unicode category expressions that the GPT-4 pattern requires. But it allocates a lot.
-
-When you disable the cache and force the CPU to do raw BPE math with `regexp2` on a 16MB file, something ugly happens. The parallel workers saturate memory, the Go runtime spends most of its time on allocation locks, and adding more cores barely moves the needle. 
-
-18.6 million allocations. Going from 1 worker to 16 bought 13% more throughput. That's the GC wall. You can throw cores at the problem, but the allocator is the actual bottleneck, and it doesn't parallelize cleanly.
-
-### Cache at the Word Level
-
-Natural language is repetitive. A server handling chat requests will see `" the"`, `" and"`, and `" of"` millions of times. Running `regexp2` and the BPE merge loop on `" the"` for the millionth time is pure waste.
-
-The architecture neutralizes this by caching at the word level via a `sync.RWMutex`-guarded map. Once `regexp2` extracts a chunk like `" the"` and the merge loop computes its token IDs, that result is stored. Every future occurrence skips the regex engine and the merge loop entirely. It's just a map lookup.
-
-Because real-world language is repetitive, the warm cache bypasses the GC wall entirely for the vast majority of requests. The aggregate result on a 25MB corpus looks like this:
-
-<div id="chart-comparison" class="chart-container"></div>
-
-A quick note on why `tokr` shows higher tokens/sec but lower MB/s. These measure different things. MB/s is bytes of input text processed per second. Tokens/sec depends on average token length. `tokr`'s vocabulary produces slightly shorter average tokens on this corpus, so more tokens are generated per byte. Both numbers are real; they just answer different questions.
-
----
-
-## What I Got Wrong
-
-If you're evaluating `tokr` for production, you need to know where it breaks.
-
-**The `sync.Pool` gap in inference:** I added `sync.Pool` to the tokenizer struct to reuse `[]int` buffers. I wired it into the training `merger()` function. I forgot to wire it into the inference hot path. `encodeCore` still allocates fresh slices on every call. The fix is to pass a pooled buffer into `runMergeLogic` as an explicit workspace parameter and return it to the pool after use.
-
-**The merge loop's O(N²) worst case:** The current `runMergeLogic` scans the token array linearly on every iteration to find the lowest-rank pair. For standard English words averaging 5–15 characters, this is effectively O(N) and fast. But feed it a pathological input, like a 10,000-character base64 string that the regex matches as a single chunk, and the loop degrades to O(N²). It burns CPU until the word finishes. The proper fix is replacing the linear scan with a doubly-linked list paired with a priority queue.
-
-**Unbounded cache growth:** The word cache has no eviction policy beyond a full-clear at 100,000 entries. On a long-running server processing diverse inputs, the cache will grow toward OOM before hitting the limit, then drop all warm entries at once. The right fix is a concurrent LRU cache with a fixed entry cap.
-
-**Static chunk size in the worker pool:** `ParallelEncode` uses a hardcoded 1MB chunk size. On a 16-core machine processing a 1.2MB file, only 2 cores get work. 14 sit idle. The chunk size should be derived dynamically based on available cores.
-
-**HTTP server timeouts:** The current `net/http` server uses default configuration, which means no read, write, or idle timeouts. A Slowloris attack will exhaust the goroutine pool immediately. 
+- `sync.Pool` unused in inference: wired into training but not the hot path
+- O(N²) on pathological input: a 10k-char base64 blob as one chunk will lock up the CPU
+- Cache eviction is a full clear: needs LRU before running on diverse-input servers
+- Worker chunk size is hardcoded: should scale dynamically with `runtime.NumCPU()`
+- No HTTP timeouts: needs `ReadTimeout` and `WriteTimeout` before going public
 
 <script src="{{ '/assets/js/charts.js' | relative_url }}"></script>
 <script>
 document.addEventListener('DOMContentLoaded', () => {
-  // Chart 1: Latency Drop
-  const latencyData = [{x: 1, y: 10.23}];
-  for(let i=2; i<=50; i++) {
-    // Drop to ~0.22 us immediately with slight noise
-    latencyData.push({x: i, y: 0.22 + (Math.random() * 0.05)});
-  }
-  new LineChart('chart-latency', {
+
+  // ── Chart 1: tokr vs tiktoken comparison (grouped bars) ──
+  new GroupedBarChart('chart-tiktoken-compare', {
+    yAxisTitle: 'Value',
+    labels: ['Throughput (MB/s)', 'Speed (M tokens/s)'],
+    datasets: [
+      { label: 'tiktoken', color: '#6c8ebf', values: [11.33, 3.7] },
+      { label: 'tokr',     color: '#d79b00', values: [9.03,  5.3] }
+    ]
+  });
+
+  // ── Chart 2: Hot vs Cold path (simple bar) ──
+  new BarChart('chart-latency-bar', {
+    data: [
+      { label: 'Uncached (cold)', value: 10.23, valueDisplay: '10.23 µs', color: '#e5534b' },
+      { label: 'Cached (hot)',    value: 0.22,  valueDisplay: '52–220 ns', color: '#4caf50' }
+    ]
+  });
+
+  // ── Chart 3: Cache latency drop line chart ──
+  const latencyData = [{x:1,y:10.23},{x:2,y:0.18},{x:3,y:0.15},{x:4,y:0.14},
+    {x:5,y:0.13},{x:6,y:0.13},{x:7,y:0.12},{x:8,y:0.12},
+    {x:9,y:0.12},{x:10,y:0.11},{x:11,y:0.11}];
+  new LineChart('chart-latency-line', {
     title: 'Cache Latency Drop',
     xAxisTitle: 'Request Number',
-    yAxisTitle: 'Latency',
+    yAxisTitle: 'Latency (µs)',
     yUnit: ' µs',
     yDecimals: 2,
     yMin: 0,
-    datasets: [{ label: 'tokr Engine', color: '#58a6ff', data: latencyData }]
+    xLabels: [1,'','','','','','','','','',11],
+    datasets: [{ label: 'tokr latency', color: '#bc1888', data: latencyData }]
   });
 
-  // Chart 2: Parallel Scaling
-  new LineChart('chart-scaling', {
-    title: 'Throughput Scaling (16MB Corpus)',
-    xAxisTitle: 'CPU Cores',
-    yAxisTitle: 'Throughput',
-    yUnit: ' MB/s',
-    xLabels: [1, 2, 4, 8, 12, 16],
-    yMin: 2.8,
-    yMax: 3.4,
+  // ── Chart 4: Single vs Parallel (grouped bars) ──
+  new GroupedBarChart('chart-scaling-bar', {
+    yAxisTitle: 'MB/s',
+    yUnit: '',
+    labels: ['Throughput'],
     datasets: [
-      { label: 'Throughput', color: '#4caf50', data: [
-        {x: 1, y: 2.93}, {x: 2, y: 3.05}, {x: 4, y: 3.15}, 
-        {x: 8, y: 3.22}, {x: 12, y: 3.27}, {x: 16, y: 3.30}
-      ]}
+      { label: 'SingleThreaded', color: '#e5534b', values: [2.93] },
+      { label: 'Parallel',       color: '#4caf50', values: [3.30] }
     ]
   });
 
-  // Chart 3: tokr vs tiktoken
-  new LineChart('chart-comparison', {
-    title: 'Tokens/Sec by Input Size (25MB Corpus)',
-    xAxisTitle: 'Input Size',
-    yAxisTitle: 'Tokens/Sec',
-    yUnit: 'M',
-    xLabels: ['1KB', '10KB', '100KB', '500KB', '1MB'],
-    datasets: [
-      { label: 'tokr (Pure Go)', color: '#58a6ff', data: [
-        {x: 1, y: 4.8}, {x: 2, y: 5.0}, {x: 3, y: 5.1}, {x: 4, y: 5.2}, {x: 5, y: 5.3}
-      ]},
-      { label: 'tiktoken (Rust)', color: '#e5534b', data: [
-        {x: 1, y: 3.4}, {x: 2, y: 3.5}, {x: 3, y: 3.6}, {x: 4, y: 3.65}, {x: 5, y: 3.7}
-      ]}
-    ]
-  });
 });
 </script>

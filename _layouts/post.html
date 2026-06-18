@@ -109,3 +109,19 @@ layout: default
     headings.forEach(heading => observer.observe(heading));
   });
 </script>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<script>
+  document.addEventListener('DOMContentLoaded', function() {
+    mermaid.initialize({ 
+      startOnLoad: true,
+      theme: 'base',
+      themeVariables: {
+        darkMode: true,
+        background: 'transparent',
+        primaryTextColor: '#fff',
+        fontFamily: 'var(--font-body)'
+      }
+    });
+  });
+</script>
